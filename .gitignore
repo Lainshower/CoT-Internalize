@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.swp
+
+# Setup
+.env
+.venv
+*.env
+*.venv
+.env.*
+.venv.*
+
+# System
+.DS_Store
+Thumbs.db
+
+# Etc
+*.log
+*.bak
+*.tmp
+*.orig
+*.old

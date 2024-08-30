@@ -1,0 +1,296 @@
+import inspect
+import torch
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, FullStateDictConfig, StateDictType
+from torch.distributed.fsdp.wrap import (
+    size_based_auto_wrap_policy
+)
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.cuda.amp import autocast
+
+import argparse
+import os
+import tqdm
+import logging
+import time
+import math
+import wandb
+import json
+import random
+from transformers import AdamW, get_linear_schedule_with_warmup
+from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
+
+from mistral import Mistral 
+from configuration import MistralConfig
+from utils import get_sep_position
+from data import CoTDataset, CoTDataCollator, extract_answer, extract_cot
+
+from torch.nn.utils.rnn import pad_sequence
+import torch.distributed as dist
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+logging.disable(logging.WARNING)
+
+def print_memory_usage(step):
+    print(f"Step: {step}")
+    print(f"Allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+    print(f"Cached: {torch.cuda.memory_reserved() / 1e9:.2f} GB")
+
+def print_model_memory(model, name):
+    total_params = sum(p.numel() for p in model.parameters())
+    total_mem = total_params * 4 / (1024 ** 3)  # Assuming float32, convert to GB
+    print(f"{name} parameters memory: {total_mem:.2f} GB")
+ 
+def setup_environ_flags(rank):
+    """Set environment flags for debugging purposes"""
+    os.environ["OMP_NUM_THREADS"] = "32"
+    os.environ["TORCH_SHOW_CPP_STACKTRACES"] = str(1)
+    os.environ["NCCL_ASYNC_ERROR_HANDLING"] = str(1)
+    if rank == 0:
+        print(f"--> Running with torch dist debug set to detail")
+
+# Initialize the process group
+def setup_distributed(rank, world_size):
+    dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+
+def clear_gpu_cache(rank=None):
+    """Clear the GPU cache for all ranks"""
+    if rank == 0:
+        print(f"Clearing GPU cache for all ranks")
+    torch.cuda.empty_cache()
+
+def save_model(local_rank, model, tokenizer, model_dir, current_epoch):
+    print('Saving model to', model_dir)
+    outpath = os.path.join(model_dir, f"epoch_{current_epoch}")
+    os.makedirs(outpath, exist_ok=True)
+
+    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+        cpu_state = model.state_dict()
+    if local_rank == 0:
+        print(f"SAVING MODEL")
+        model.save_pretrained(outpath, state_dict=cpu_state)
+        tokenizer.save_pretrained(outpath)
+
+def evaluate(dataloader, model, tokenizer,  max_new_tokens=512, skip=0, log_predictions=False, epoch=None, save_path=None):
+    model.eval()
+
+    total_instances = 0
+    total_tokens = 0
+    total_correct = 0
+    total_correct_tokens = 0
+    total_loss = 0
+
+    predictions = []
+
+    for batch in tqdm.tqdm(dataloader, desc="Evaluating"):
+        input_ids_all = batch['input_ids'].cuda()
+        labels = batch['labels'].cuda()
+
+        # Remove answer part
+        sep_positions = get_sep_position(input_ids_all, tokenizer.eos_token_id)
+        for i, (input_ids_all_i, label_i) in enumerate(zip(input_ids_all, labels)):
+            output = model.compute_loss(input_ids=input_ids_all_i.unsqueeze(0), labels=label_i.unsqueeze(0))
+            total_loss += output.loss
+
+            # Truncate input_ids_all_i for generation => Generation
+            sep_position = sep_positions[i].item()
+            truncated_input = input_ids_all_i[:sep_position + 1]  # +1 to include the separator token
+            
+            # Generate using the truncated input
+            stop_on_two_eos = True
+            generated_output = model.generate(
+                input_ids=truncated_input.unsqueeze(0),
+                max_new_tokens=max_new_tokens,
+                stop_on_two_eos=stop_on_two_eos,
+            )
+    
+            tgt = input_ids_all_i[sep_position+1:] # Slicing Out CoT;Answer
+            tgt_text = tokenizer.decode(tgt, skip_special_tokens=True)
+            ans = extract_answer(tgt_text)
+            # print(tokenizer.decode(generated_output[0][0], skip_special_tokens=True))
+            # print(tokenizer.decode(generated_output[0][0][sep_position+1:], skip_special_tokens=True))
+            pred_text = tokenizer.decode(generated_output[0][0][sep_position+1:], skip_special_tokens=True)
+            pred_ans = extract_answer(pred_text)
+
+            if log_predictions:
+                predictions.append({
+                    'PPL for Full Instance': output.loss.exp().item(),
+                    'Input': tokenizer.decode(truncated_input, skip_special_tokens=True),
+                    'Target': tgt_text,
+                    'Predicted': pred_text,
+                })
+
+            if ans == pred_ans:
+                total_correct += 1
+
+            total_correct_tokens += 1
+            total_instances += 1
+
+    accuracy = total_correct / total_instances
+    loss = total_loss / total_instances
+
+    # Save predictions for each epoch
+    if epoch is not None and save_path is not None:
+        with open(os.path.join(save_path, f'epoch_{epoch}_predictions.jsonl'), 'w') as f:
+            for pred in predictions:
+                json.dump(pred, f)
+                f.write('\n')
+
+    return loss, accuracy, predictions
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--train_path', type=str, required=True)
+    parser.add_argument('--val_path', type=str, required=True)
+    parser.add_argument('--save_model', type=str, required=True)
+    parser.add_argument('--base_model', type=str, default='mistralai/Mistral-7B-v0.1')
+    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--lr', type=float, default=5e-5)
+    parser.add_argument('--accumulate', type=int, default=1)
+    parser.add_argument('--max_grad_norm', type=float, default=1.0)
+    parser.add_argument('--bf16', action='store_true')
+    parser.add_argument('--max_new_tokens', type=int, default=150)
+    args = parser.parse_args()
+    print(args)
+
+    random.seed(486)
+    torch.manual_seed(486)
+
+    dtype = 'float32'
+    if args.bf16:
+        dtype = 'bfloat16'
+    ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    world_size = int(os.environ.get("WORLD_SIZE", -1))
+
+    if -1 in [local_rank, world_size]:
+        raise ValueError("Environment variables not set correctly")
+
+    setup_environ_flags(local_rank)
+    setup_distributed(rank=local_rank, world_size=world_size)
+
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    clear_gpu_cache(local_rank)
+
+    if local_rank == 0:
+        wandb.init(
+            project="Mistral-GSM8K",
+            name=f"learning_config_ep{args.epochs}_bsz{args.batch_size}_lr{args.lr}",
+            config=args
+        )
+
+    config = MistralConfig(base_model=args.base_model)
+    model = Mistral(config).to(local_rank)
+
+    fsdp_config = dict(
+        auto_wrap_policy=size_based_auto_wrap_policy,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        device_id=torch.cuda.current_device(),
+        mixed_precision=MixedPrecision(
+            param_dtype=ptdtype,
+            reduce_dtype=ptdtype,
+            buffer_dtype=ptdtype,
+        ),
+    )
+
+    model = FSDP(model, **fsdp_config)
+
+    tokenizer = model.tokenizer
+    collate_fn = CoTDataCollator(tokenizer)
+    train_dataset = CoTDataset(tokenizer, args.train_path, 512, max_size=-1, is_test=False, train_file=None, num_demonstrations=-1)
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=local_rank)
+    train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=collate_fn, sampler=train_sampler)
+    val_dataset = CoTDataset(tokenizer, args.val_path, 512,  max_size=-1, is_test=False, train_file=None, num_demonstrations=-1)
+    val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=local_rank, shuffle=False)
+    val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=collate_fn, sampler=val_sampler)
+
+    total_steps = len(train_dataloader) * args.epochs
+    warmup_steps = min(int(0.1 * total_steps), 100)
+
+    trainable_params = list(model.parameters())
+    use_fused = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+    extra_args = dict(fused=True) if use_fused else dict()
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, **extra_args)
+
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)   
+
+    model.train()
+    start_time = time.time()
+    max_training_time = 24 * 60 * 60  # 24 hours in seconds
+
+    global_step = 0
+    best_val = 999
+    best_accuracy = 0
+    best_model_path = os.path.join(args.save_model, 'best_model')
+
+    for epoch in range(args.epochs):
+        print(f"Epoch {epoch}")
+        epoch_loss = 0
+        train_sampler.set_epoch(epoch)
+        for batch in tqdm.tqdm(train_dataloader):
+            input_ids = batch['input_ids'].to(local_rank)
+            labels = batch['labels'].to(local_rank)
+            optimizer.zero_grad()
+            outputs = model.compute_loss(input_ids=input_ids, labels=labels)
+            loss = outputs.loss
+            loss.div(args.accumulate).backward()
+            if global_step % args.accumulate == 0:
+                torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            if local_rank == 0:
+                wandb.log({"train_step_loss": loss.item(), "train_step_ppl": loss.exp().item(),  "step": global_step})
+
+            if time.time() - start_time > max_training_time:
+                print("Reached 24-hour time limit. Stopping training.")
+                break
+
+            epoch_loss += loss.item()
+            global_step += 1
+
+        avg_train_loss = epoch_loss / len(train_dataloader)
+
+        if local_rank == 0:
+            wandb.log({"train_epoch_loss": avg_train_loss, "epoch": epoch})
+
+        model.eval()
+        with torch.no_grad():
+            val_loss, accuracy, predictions = evaluate(val_dataloader, model, tokenizer, args.max_new_tokens, skip=0, log_predictions=True, epoch=epoch, save_path=args.save_model)
+            print(f'Accuracy: {accuracy}')
+            if local_rank == 0:
+                wandb.log({
+                    "val_total_loss": val_loss,
+                    "val_accuracy": accuracy,
+                    "epoch": epoch
+                })
+
+            # Save the best model based on both loss and accuracy
+            if val_loss < best_val or accuracy > best_accuracy:
+                best_val = min(best_val, val_loss)
+                best_accuracy = max(best_accuracy, accuracy)
+                save_model(local_rank, model, tokenizer, best_model_path, epoch)
+                print(f"New best model saved with loss: {best_val} and accuracy: {best_accuracy}")
+
+        model.train()
+
+        if time.time() - start_time > max_training_time:
+            break
+
+    if local_rank == 0:
+        total_time = (time.time() - start_time) / 3600
+        print(f"Training completed. Total time: {total_time:.2f} hours")
+        wandb.log({"total_training_time": total_time})
+        print(f"Best model saved with accuracy: {best_accuracy}")
+        wandb.finish()
+
+    dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()

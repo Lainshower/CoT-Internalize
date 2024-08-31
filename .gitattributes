@@ -1,3 +1,9 @@
 data/4_by_4_mult/train.txt filter=lfs diff=lfs merge=lfs -text
 data/5_by_5_mult/train.txt filter=lfs diff=lfs merge=lfs -text
-data/gsm8k/* filter=lfs diff=lfs merge=lfs -text
+data/gsm8k/train.txt filter=lfs diff=lfs merge=lfs -text
+data/gsm8k/train_orig.txt filter=lfs diff=lfs merge=lfs -text
+data/gsm8k/train_no_aug.txt filter=lfs diff=lfs merge=lfs -text
+data/gsm8k/valid.txt filter=lfs diff=lfs merge=lfs -text
+data/gsm8k/valid_orig.txt filter=lfs diff=lfs merge=lfs -text
+data/gsm8k/test.txt filter=lfs diff=lfs merge=lfs -text
+data/gsm8k/test_orig.txt filter=lfs diff=lfs merge=lfs -text

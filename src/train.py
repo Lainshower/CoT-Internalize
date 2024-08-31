@@ -2,7 +2,8 @@ import inspect
 import torch
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy, FullStateDictConfig, StateDictType
 from torch.distributed.fsdp.wrap import (
-    size_based_auto_wrap_policy
+    size_based_auto_wrap_policy,
+    transformer_auto_wrap_policy,
 )
 from torch.utils.data import DataLoader, DistributedSampler
 from torch.cuda.amp import autocast
@@ -17,7 +18,6 @@ import wandb
 import json
 import random
 from transformers import AdamW, get_linear_schedule_with_warmup
-from transformers.models.mistral.modeling_mistral import MistralDecoderLayer
 
 from mistral import Mistral 
 from configuration import MistralConfig
@@ -66,11 +66,69 @@ def save_model(local_rank, model, tokenizer, model_dir, current_epoch):
 
     save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-        cpu_state = model.state_dict()
+        state_dict = model.module.state_dict()
+
     if local_rank == 0:
         print(f"SAVING MODEL")
-        model.save_pretrained(outpath, state_dict=cpu_state)
+        model.save_pretrained(outpath, state_dict=state_dict)
         tokenizer.save_pretrained(outpath)
+
+def compute_entropy_improvement(entropies, threshold=0.7):
+    """
+    Compute if entropy shows an increasing trend across layers.
+    Returns True if entropy increases for the majority of layer transitions.
+    """
+    increases = [entropies[i] < entropies[i+1] for i in range(len(entropies)-1)]
+    return sum(increases) / len(increases) >= threshold
+
+def process_batch_with_entropy(model, input_ids, labels, tokenizer, global_step, loss_threshold):
+    """
+    Process the batch with step-by-step entropy-based CoT removal.
+    """
+    batch_size = input_ids.size(0)
+    new_input_ids = []
+    new_labels = []
+
+    for i in range(batch_size):
+        single_input = input_ids[i].unsqueeze(0)
+        single_label = labels[i].unsqueeze(0)
+
+        question_end = get_sep_position(single_input, tokenizer.eos_token_id, skip=0).item()
+        cot_end = get_sep_position(single_input, tokenizer.eos_token_id, skip=1).item()
+        answer_end = get_sep_position(single_input, tokenizer.eos_token_id, skip=2).item()
+
+        question = single_input[:, :question_end+1]
+        cot = single_input[:, question_end+1:cot_end+1]
+        answer = single_input[:, cot_end+1:answer_end+1]
+
+        # Split CoT into individual rationales
+        rationales = cot.split(1, dim=1)
+
+        # Start with [q;r_1]
+        current_input = torch.cat([question, rationales[0]], dim=1)
+        current_entropies = model.compute_entropy(current_input, single_label[:, :current_input.size(1)], interval=1).cross_entropies[0]
+
+        for j in range(1, len(rationales)):
+            test_input = torch.cat([current_input, rationales[j]], dim=1)
+            test_entropies = model.compute_entropy(test_input, single_label[:, :test_input.size(1)], interval=1).cross_entropies[0]
+            
+            if compute_entropy_improvement(test_entropies):
+                # Entropy shows increasing trend, keep this rationale
+                current_input = test_input
+                current_entropies = test_entropies
+            else:
+                # No improvement, stop adding rationales
+                break
+
+        # Add answer to the final input
+        new_input = torch.cat([current_input, answer], dim=1)
+
+        new_label = torch.full_like(new_input, -100)
+        new_label[:, 1:] = new_input[:, 1:]  # Shift right for next token prediction
+        new_label[new_label == tokenizer.pad_token_id] = -100  # Mask padding
+
+        new_input_ids.append(new_input.squeeze(0))
+        new_labels.append(new_label.squeeze(0))
 
 def evaluate(dataloader, model, tokenizer,  max_new_tokens=512, skip=0, log_predictions=False, epoch=None, save_path=None):
     model.eval()
@@ -236,6 +294,15 @@ def main():
         for batch in tqdm.tqdm(train_dataloader):
             input_ids = batch['input_ids'].to(local_rank)
             labels = batch['labels'].to(local_rank)
+
+            #### Truncation
+            first_sep_positions = get_sep_position(input_ids, tokenizer.eos_token_id)
+            second_sep_positions = get_sep_position(input_ids, tokenizer.eos_token_id, skip=1)
+
+            #### Entropy Calculation
+
+            #### Entropy 
+
             optimizer.zero_grad()
             outputs = model.compute_loss(input_ids=input_ids, labels=labels)
             loss = outputs.loss

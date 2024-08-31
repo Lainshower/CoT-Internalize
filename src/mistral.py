@@ -16,9 +16,10 @@ class Mistral(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
         self.tokenizer.pad_token = self.tokenizer.eos_token
         self.base_model.resize_token_embeddings(len(self.tokenizer))
+        self.lm_head = self.base_model.get_output_embeddings() # For computing Entropy
         
-    def forward(self, input_ids, labels=None):
-        outputs = self.base_model(input_ids=input_ids, labels=labels)
+    def forward(self, input_ids, labels=None, output_hidden_states=False):
+        outputs = self.base_model(input_ids=input_ids, labels=labels, output_hidden_states=output_hidden_states)
         return outputs
 
     def compute_loss(self, input_ids, labels):
@@ -43,6 +44,54 @@ class Mistral(nn.Module):
         outputs.total_tokens = total_tokens
         return outputs
 
+    def compute_entropy(self, input_ids, labels, interval):
+        outputs = self.forward(input_ids=input_ids, labels=labels, output_hidden_states=True)
+        hidden_states = outputs.hidden_states
+
+        num_layers = len(hidden_states)
+        selected_indices = list(range(0, num_layers, interval))
+        if (num_layers - 1) not in selected_indices:
+            selected_indices.append(num_layers - 1)  # Ensure the last layer is included
+
+        cross_entropies = []
+        for i in selected_indices:
+            layer_hidden = hidden_states[i]  # Shape: [batch_size, seq_len, hidden_size]
+            layer_logits = self.lm_head(layer_hidden)  # Shape: [batch_size, seq_len, vocab_size]
+            layer_cross_entropy = self.calculate_entropy(layer_logits, input_ids)
+            cross_entropies.append(layer_cross_entropy)
+
+        # Stack the results: [num_selected_layers, batch_size]
+        cross_entropies = torch.stack(cross_entropies)
+        
+        # Transpose to get [batch_size, num_selected_layers]
+        cross_entropies = cross_entropies.t()
+
+        outputs.cross_entropies = cross_entropies
+        return outputs
+
+    def calculate_entropy(self, logits, input_ids):
+        # logits shape: [batch_size, seq_len, vocab_size]
+        # input_ids shape: [batch_size, seq_len]
+        
+        # Shift logits and input_ids for next-token prediction
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = input_ids[:, 1:].contiguous()
+        
+        # Calculate cross-entropy
+        loss_fct = CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id, reduction='none')
+        cross_entropy = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        
+        # Reshape cross-entropy to [batch_size, seq_len]
+        cross_entropy = cross_entropy.view(shift_labels.size())
+        
+        # Create mask for non-padding tokens
+        mask = (shift_labels != self.tokenizer.pad_token_id).float()
+        
+        # Compute mean per sample
+        sample_cross_entropy = (cross_entropy * mask).sum(dim=-1) / mask.sum(dim=-1)
+        
+        return sample_cross_entropy  # Shape: [batch_size]
+    
     def generate(self, input_ids, max_new_tokens=512, num_beams=1, stop_on_two_eos=True, test=False):
         if test == False:
             sep_positions = get_sep_position(input_ids, self.tokenizer.eos_token_id)
@@ -84,8 +133,9 @@ class Mistral(nn.Module):
         model.load_state_dict(state_dict)
         return model
 
-    def save_pretrained(self, save_directory):
+    def save_pretrained(self, save_directory, state_dict=None):
         print(f'Saving to {save_directory}')
         self.config.save_pretrained(save_directory)
-        state_dict = self.state_dict()
+        if state_dict is None:
+            state_dict = self.state_dict()
         torch.save(state_dict, os.path.join(save_directory, 'state_dict.bin'))

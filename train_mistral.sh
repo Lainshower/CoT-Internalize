@@ -6,7 +6,7 @@ NUM_GPUS=3
 # Set your parameters
 TRAIN_PATH="data/gsm8k/train_orig.txt"
 VAL_PATH="data/gsm8k/valid_orig.txt"
-export SAVE="train_mistral/gsm8k_orig"
+export SAVE="train_mistral/gsm8k_orig-test"
 BASE_MODEL="mistralai/Mistral-7B-v0.1"
 EPOCHS=10
 BATCH_SIZE=4

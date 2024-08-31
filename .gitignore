@@ -24,5 +24,7 @@ Thumbs.db
 *.orig
 *.old
 
-# Data
+# Ignore everything in the data directory except specific files
 data/*
+
+!data/gsm8k/train.txt

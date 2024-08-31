@@ -23,3 +23,6 @@ Thumbs.db
 *.tmp
 *.orig
 *.old
+
+# Data
+data/gsm8k/*

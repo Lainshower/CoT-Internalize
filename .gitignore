@@ -25,4 +25,4 @@ Thumbs.db
 *.old
 
 # Data
-data/*
+/data/*

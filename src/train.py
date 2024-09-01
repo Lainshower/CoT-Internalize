@@ -21,7 +21,7 @@ from transformers import AdamW, get_linear_schedule_with_warmup
 
 from mistral import Mistral 
 from configuration import MistralConfig
-from utils import get_sep_position
+from utils import get_sep_position, tensorize_batch, split_rationale, compute_entropy_improvement
 from data import CoTDataset, CoTDataCollator, extract_answer, extract_cot
 
 from torch.nn.utils.rnn import pad_sequence
@@ -73,13 +73,25 @@ def save_model(local_rank, model, tokenizer, model_dir, current_epoch):
         model.save_pretrained(outpath, state_dict=state_dict)
         tokenizer.save_pretrained(outpath)
 
-def compute_entropy_improvement(entropies, threshold=0.7):
+def process_rationales(model, question, rationales, labels, check_entropy):
     """
-    Compute if entropy shows an increasing trend across layers.
-    Returns True if entropy increases for the majority of layer transitions.
+    Process rationales based on entropy improvement in a generalized manner.
     """
-    increases = [entropies[i] < entropies[i+1] for i in range(len(entropies)-1)]
-    return sum(increases) / len(increases) >= threshold
+    if not rationales:
+        return question
+
+    current_input = question
+    i = 0
+    while i < len(rationales):
+        test_input = torch.cat([current_input, rationales[i]], dim=1)
+        if check_entropy(test_input):
+            current_input = test_input
+            i += 1
+        else:
+            # Skip this rationale and return all subsequent ones
+            return torch.cat([current_input] + rationales[i+1:], dim=1)
+        
+    return current_input
 
 def process_batch_with_entropy(model, input_ids, labels, tokenizer, global_step, loss_threshold):
     """
@@ -102,33 +114,32 @@ def process_batch_with_entropy(model, input_ids, labels, tokenizer, global_step,
         answer = single_input[:, cot_end+1:answer_end+1]
 
         # Split CoT into individual rationales
-        rationales = cot.split(1, dim=1)
+        rationales = split_rationale(cot, tokenizer)
 
-        # Start with [q;r_1]
-        current_input = torch.cat([question, rationales[0]], dim=1)
-        current_entropies = model.compute_entropy(current_input, single_label[:, :current_input.size(1)], interval=1).cross_entropies[0]
+        def check_entropy(input_sequence):
+            entropies = model.compute_entropy(input_sequence, single_label[:, :input_sequence.size(1)], interval=1).cross_entropies[0]
+            return compute_entropy_improvement(entropies)
 
-        for j in range(1, len(rationales)):
-            test_input = torch.cat([current_input, rationales[j]], dim=1)
-            test_entropies = model.compute_entropy(test_input, single_label[:, :test_input.size(1)], interval=1).cross_entropies[0]
-            
-            if compute_entropy_improvement(test_entropies):
-                # Entropy shows increasing trend, keep this rationale
-                current_input = test_input
-                current_entropies = test_entropies
-            else:
-                # No improvement, stop adding rationales
-                break
+        # Process rationales
+        processed_input = process_rationales(model, question, rationales, single_label, check_entropy)
 
         # Add answer to the final input
-        new_input = torch.cat([current_input, answer], dim=1)
+        new_input = torch.cat([processed_input, answer], dim=1)
 
+        # Create labels for the new input
         new_label = torch.full_like(new_input, -100)
-        new_label[:, 1:] = new_input[:, 1:]  # Shift right for next token prediction
+        new_label[:, question_end+1:] = new_input[:, question_end+1:]  # Only predict from after the question
         new_label[new_label == tokenizer.pad_token_id] = -100  # Mask padding
 
         new_input_ids.append(new_input.squeeze(0))
         new_labels.append(new_label.squeeze(0))
+
+    # Pad sequences to the same length
+    new_input_ids = tensorize_batch(new_input_ids)
+    new_labels = tensorize_batch(new_labels)
+
+    return new_input_ids, new_labels
+
 
 def evaluate(dataloader, model, tokenizer,  max_new_tokens=512, skip=0, log_predictions=False, epoch=None, save_path=None):
     model.eval()

@@ -1,5 +1,10 @@
 import torch
 from transformers import StoppingCriteria, LogitsProcessor
+from torch.nn.utils.rnn import pad_sequence
+
+'''
+BASIC UTILS
+'''
 
 def get_sep_position(input_ids, sep_id, skip=0):
     batch_size = input_ids.shape[0]
@@ -13,6 +18,40 @@ def get_sep_position(input_ids, sep_id, skip=0):
         sep_positions[batch_id] = sep_position
     return sep_positions
 
+def tensorize_batch(examples):
+    if isinstance(examples[0], (list, tuple)):
+        examples = [torch.tensor(e, dtype=torch.long) for e in examples]
+    length_of_first = examples[0].size(0)
+    are_tensors_same_length = all(x.size(0) == length_of_first for x in examples)
+    if are_tensors_same_length:
+        return torch.stack(examples, dim=0)
+    else:
+        return pad_sequence(examples, batch_first=True, padding_value=-100)
+
+'''
+ENTROPY CALCULATION
+'''
+
+def compute_entropy_improvement(entropies, threshold=0.7):
+    """
+    Compute if entropy shows an increasing trend across layers.
+    Returns True if entropy increases for the majority of layer transitions.
+    """
+    increases = [entropies[i] < entropies[i+1] for i in range(len(entropies)-1)]
+    return sum(increases) / len(increases) >= threshold
+
+def split_rationale(rationale, tokenizer):
+    """
+    Split the rationale into sentences based on end-of-sentence tokens.
+    """
+    eos_tokens = [tokenizer.convert_tokens_to_ids(t) for t in ['.', '!', '?']]
+    sentence_ends = [i for i, token in enumerate(rationale[0]) if token in eos_tokens]
+    sentence_starts = [0] + [i + 1 for i in sentence_ends[:-1]]
+    return [rationale[:, start:end+1] for start, end in zip(sentence_starts, sentence_ends)]
+
+'''
+GENERATION UTILS
+'''
 
 # Stop generation only after generating two EOSs, such as  z <eos> y <eos>
 class DoubleEOSStoppingCriteria(StoppingCriteria):

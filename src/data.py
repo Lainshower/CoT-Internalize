@@ -5,24 +5,27 @@ import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
-def extract_answer(text):
-    split_pattern = '####'
-    if split_pattern not in text:
-        return text.strip().replace(',', '') #  '####'가 없으면 answer 부분에서 ','만 제거해서 text 만환
-    else:
-        _, ans = text.strip().split('####', 1)
-        ans = '####' + ans
-        ans = ans.strip().replace(',', '') # #### 부분에서 answer 부분 수정
-        return ans
+def clean_text(text):
+    return text.strip().replace(',', '')
 
-def extract_cot(text):
-    split_pattern = '####'
+def split_text(text, split_pattern):
     if split_pattern not in text:
-        return None
+        return None, clean_text(text)
     else:
-        cot, _ = text.strip().split('####', 1)
-        cot = cot.strip()
-        return cot
+        parts = text.split(split_pattern, 1)
+        return clean_text(parts[0]), clean_text(parts[1])
+
+def extract_answer_w_prefix(text):
+    _, ans = split_text(text, '####')
+    return f"The answer is {ans}." if '####' in text else ans
+
+def extract_answer(text):
+    _, ans = split_text(text, 'The answer is')
+    return ans.replace('.', '') if 'The answer is' in text else ans
+
+def extract_cot_w_prefix(text):
+    cot, _ = split_text(text, '####')
+    return f"Answer: {cot}" if cot else None
 
 class CoTDataset(Dataset):
     def __init__(self, tokenizer, file_path: str, max_length: int, max_size=-1, is_test=False, train_file='data/gsm8k/train_orig', num_demonstrations=5):
@@ -58,8 +61,8 @@ class CoTDataset(Dataset):
         tgt_lines = list(tgt_lines)
         examples = []
         for src, tgt in zip(src_lines, tgt_lines):
-            ans = extract_answer(tgt)
-            cot = extract_cot(tgt)
+            ans = extract_answer_w_prefix(tgt)
+            cot = extract_cot_w_prefix(tgt)
             example = {
                 'src': src,
                 'cot': cot,

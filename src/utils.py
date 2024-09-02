@@ -42,12 +42,26 @@ def compute_entropy_improvement(entropies, threshold=0.7):
 
 def split_rationale(rationale, tokenizer):
     """
-    Split the rationale into sentences based on end-of-sentence tokens.
+    Split the rationale into sentences based on splitters.
     """
-    eos_tokens = [tokenizer.convert_tokens_to_ids(t) for t in ['.', '!', '?']]
-    sentence_ends = [i for i, token in enumerate(rationale[0]) if token in eos_tokens]
-    sentence_starts = [0] + [i + 1 for i in sentence_ends[:-1]]
-    return [rationale[:, start:end+1] for start, end in zip(sentence_starts, sentence_ends)]
+    sentence_splitters = [tokenizer.convert_tokens_to_ids(t) for t in ['.', '!', '?']]
+    sentence_ends = [i for i, token in enumerate(rationale[0]) if token in sentence_splitters]
+    
+    if not sentence_ends:
+        # Return the entire rationale as a single sentence, matching the dimension of split sentences
+        return [rationale[:, :]]
+    
+    sentences = []
+    start = 0
+    for end in sentence_ends:
+        sentences.append(rationale[:, start:end+1])
+        start = end + 1  # Start of next sentence is right after the end of current sentence
+    
+    # Add any remaining text after the last sentence splitter
+    if start < rationale.size(1):
+        sentences.append(rationale[:, start:])
+    
+    return sentences
 
 '''
 GENERATION UTILS

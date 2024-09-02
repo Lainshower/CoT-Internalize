@@ -6,10 +6,12 @@ NUM_GPUS=3
 # Set your parameters
 TRAIN_PATH="data/gsm8k/train_orig.txt"
 VAL_PATH="data/gsm8k/valid_orig.txt"
-export SAVE="train_mistral/gsm8k_orig-test"
+export SAVE_M="mistral/gsm8k"
+export SAVE_D="mistral/gsm8k-training-data"
 BASE_MODEL="mistralai/Mistral-7B-v0.1"
 EPOCHS=10
 BATCH_SIZE=4
+WARM_UP=0.1
 LEARNING_RATE=5e-5
 ACUMULATE=2
 GRAD_NORM=1.0
@@ -22,10 +24,12 @@ torchrun --nproc_per_node=$NUM_GPUS \
     src/train_mistral.py \
     --train_path $TRAIN_PATH \
     --val_path $VAL_PATH \
-    --save_model $SAVE \
+    --save_model $SAVE_M \
+    --save_data $SAVE_D \
     --base_model $BASE_MODEL \
     --epochs $EPOCHS \
     --batch_size $BATCH_SIZE \
+    --warmup_ratio $WARM_UP \
     --lr $LEARNING_RATE \
     --accumulate $ACUMULATE \
     --max_grad_norm $GRAD_NORM \

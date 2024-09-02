@@ -22,7 +22,7 @@ from transformers import AdamW, get_linear_schedule_with_warmup
 from mistral import Mistral 
 from configuration import MistralConfig
 from utils import get_sep_position, tensorize_batch, split_rationale, compute_entropy_improvement
-from data import CoTDataset, CoTDataCollator, extract_answer, extract_cot
+from data import CoTDataset, CoTDataCollator, extract_answer, extract_answer_w_prefix, extract_cot_w_prefix
 
 from torch.nn.utils.rnn import pad_sequence
 import torch.distributed as dist
@@ -73,31 +73,60 @@ def save_model(local_rank, model, tokenizer, model_dir, current_epoch):
         model.save_pretrained(outpath, state_dict=state_dict)
         tokenizer.save_pretrained(outpath)
 
-def process_rationales(model, question, rationales, labels, check_entropy):
+def check_entropy(model, input_sequence, label_sequence):
+    entropies = model.compute_entropy(input_sequence, label_sequence, interval=1).cross_entropies[0]
+    return compute_entropy_improvement(entropies)
+
+def process_rationales(model, question, rationales, single_label, max_removes_ratio):
     """
-    Process rationales based on entropy improvement in a generalized manner.
+    Process rationales based on entropy improvement, limiting discards based on training progress.
+    Ensures consistency between input and label removals.
     """
     if not rationales:
-        return question
-
+        return question, single_label[:, :question.size(1)], []
+    
     current_input = question
+    current_label = single_label[:, :question.size(1)]
+    removed = 0
     i = 0
-    while i < len(rationales):
-        test_input = torch.cat([current_input, rationales[i]], dim=1)
-        if check_entropy(test_input):
-            current_input = test_input
-            i += 1
-        else:
-            # Skip this rationale and return all subsequent ones
-            return torch.cat([current_input] + rationales[i+1:], dim=1)
-        
-    return current_input
+    removed_indices = []
+    label_start_idx = question.size(1)
 
-def process_batch_with_entropy(model, input_ids, labels, tokenizer, global_step, loss_threshold):
+    max_removes = round(max_removes_ratio * len(rationales))
+    while i < len(rationales) and removed < max_removes:
+        rationale_size = rationales[i].size(1)
+
+        # Prepend rationale sentence to the input
+        test_input = torch.cat([current_input, rationales[i]], dim=1)
+        
+        # Prepend corresponding rationale index to the test
+        test_label = torch.cat([current_label, single_label[:, label_start_idx:label_start_idx + rationale_size]], dim=1)
+
+        if check_entropy(model, test_input, test_label):
+            current_input = test_input
+            current_label = test_label
+        else:
+            removed_indices.append(i)
+            discarded += 1
+
+        i += 1
+        label_start_idx += rationale_size
+
+    # Add remaining rationales if any
+    if i < len(rationales):
+        remaining_input = torch.cat(rationales[i:], dim=1)
+        remaining_label = single_label[:, label_start_idx:]
+        current_input = torch.cat([current_input, remaining_input], dim=1)
+        current_label = torch.cat([current_label, remaining_label], dim=1)
+
+    return current_input, current_label, removed_indices
+
+def process_batch_with_entropy(model, input_ids, labels, tokenizer, max_removes_ratio):
     """
     Process the batch with step-by-step entropy-based CoT removal.
     """
     batch_size = input_ids.size(0)
+    rationale_prefix_len = len(tokenizer.tokenize("Answer:"))
     new_input_ids = []
     new_labels = []
 
@@ -109,27 +138,24 @@ def process_batch_with_entropy(model, input_ids, labels, tokenizer, global_step,
         cot_end = get_sep_position(single_input, tokenizer.eos_token_id, skip=1).item()
         answer_end = get_sep_position(single_input, tokenizer.eos_token_id, skip=2).item()
 
-        question = single_input[:, :question_end+1]
-        cot = single_input[:, question_end+1:cot_end+1]
+        # Incorporate 'Answer:' to question
+        question = single_input[:, :question_end+1+rationale_prefix_len]
+        cot = single_input[:, question_end+1+rationale_prefix_len:cot_end+1] 
         answer = single_input[:, cot_end+1:answer_end+1]
 
         # Split CoT into individual rationales
         rationales = split_rationale(cot, tokenizer)
 
-        def check_entropy(input_sequence):
-            entropies = model.compute_entropy(input_sequence, single_label[:, :input_sequence.size(1)], interval=1).cross_entropies[0]
-            return compute_entropy_improvement(entropies)
-
         # Process rationales
-        processed_input = process_rationales(model, question, rationales, single_label, check_entropy)
+        processed_input, processed_label, removed_indices = process_rationales(model, question, rationales, single_label, max_removes_ratio)
 
         # Add answer to the final input
         new_input = torch.cat([processed_input, answer], dim=1)
 
         # Create labels for the new input
-        new_label = torch.full_like(new_input, -100)
-        new_label[:, question_end+1:] = new_input[:, question_end+1:]  # Only predict from after the question
-        new_label[new_label == tokenizer.pad_token_id] = -100  # Mask padding
+        new_label = torch.cat([processed_label, single_label[:, cot_end+1:answer_end+1]], dim=1)
+
+        assert new_input.shape == new_label.shape, f"Shape of the new_input is {new_input.shape} but the shape of the new label is {new_label.shape}"
 
         new_input_ids.append(new_input.squeeze(0))
         new_labels.append(new_label.squeeze(0))
@@ -213,9 +239,11 @@ def main():
     parser.add_argument('--train_path', type=str, required=True)
     parser.add_argument('--val_path', type=str, required=True)
     parser.add_argument('--save_model', type=str, required=True)
+    parser.add_argument('--save_data', type=str, required=True)
     parser.add_argument('--base_model', type=str, default='mistralai/Mistral-7B-v0.1')
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--warmup_ratio', type=float, default=0.01)
     parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--accumulate', type=int, default=1)
     parser.add_argument('--max_grad_norm', type=float, default=1.0)
@@ -301,27 +329,38 @@ def main():
     for epoch in range(args.epochs):
         print(f"Epoch {epoch}")
         epoch_loss = 0
+        epoch_step = 1
         train_sampler.set_epoch(epoch)
         for batch in tqdm.tqdm(train_dataloader):
             input_ids = batch['input_ids'].to(local_rank)
             labels = batch['labels'].to(local_rank)
 
-            #### Truncation
-            first_sep_positions = get_sep_position(input_ids, tokenizer.eos_token_id)
-            second_sep_positions = get_sep_position(input_ids, tokenizer.eos_token_id, skip=1)
-
-            #### Entropy Calculation
-
-            #### Entropy 
+            #### Remove the rationales after the warmup steps
+            if epoch_step/len(train_dataloader) > args.warmup_ratio:
+                #### Calculate entropy of the rationale and remove the unnecessary part
+                input_ids, labels = process_batch_with_entropy(model, input_ids, labels, tokenizer, epoch_step/len(train_dataloader))
 
             optimizer.zero_grad()
             outputs = model.compute_loss(input_ids=input_ids, labels=labels)
             loss = outputs.loss
             loss.div(args.accumulate).backward()
-            if global_step % args.accumulate == 0:
+            if global_step % args.accumulate == 0 or global_step % len(train_dataloader)==0:
                 torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+
+            if local_rank == 0 and epoch_step%100:
+                training_step_data = []
+                for input_, label_ in zip(input_ids, labels):
+                    predictions.append({
+                        'Input': tokenizer.decode(input_, skip_special_tokens=True),
+                        'Target': tokenizer.decode(label_, skip_special_tokens=True),
+                    })
+                with open(os.path.join(args.save_data, f'epoch_{epoch}_trainig-step_{epoch_step}_data.jsonl'), 'w') as f:
+                    for datum in training_step_data:
+                        json.dump(datum, f)
+                        f.write('\n')
 
             if local_rank == 0:
                 wandb.log({"train_step_loss": loss.item(), "train_step_ppl": loss.exp().item(),  "step": global_step})
@@ -331,6 +370,7 @@ def main():
                 break
 
             epoch_loss += loss.item()
+            epoch_step += 1
             global_step += 1
 
         avg_train_loss = epoch_loss / len(train_dataloader)

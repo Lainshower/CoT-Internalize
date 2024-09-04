@@ -74,7 +74,7 @@ def save_model(local_rank, model, tokenizer, model_dir, current_epoch):
         tokenizer.save_pretrained(outpath)
 
 def check_entropy(model, input_sequence, label_sequence):
-    entropies = model.compute_entropy(input_sequence, label_sequence, interval=1).cross_entropies[0]
+    entropies = model.compute_entropy(input_sequence, label_sequence, interval=4).cross_entropies[0]
     return compute_entropy_improvement(entropies)
 
 def process_rationales(model, question, rationales, single_label, max_removes_ratio):
@@ -107,7 +107,7 @@ def process_rationales(model, question, rationales, single_label, max_removes_ra
             current_label = test_label
         else:
             removed_indices.append(i)
-            discarded += 1
+            removed += 1
 
         i += 1
         label_start_idx += rationale_size
@@ -126,7 +126,6 @@ def process_batch_with_entropy(model, input_ids, labels, tokenizer, max_removes_
     Process the batch with step-by-step entropy-based CoT removal.
     """
     batch_size = input_ids.size(0)
-    rationale_prefix_len = len(tokenizer.tokenize("Answer:"))
     new_input_ids = []
     new_labels = []
 
@@ -138,9 +137,8 @@ def process_batch_with_entropy(model, input_ids, labels, tokenizer, max_removes_
         cot_end = get_sep_position(single_input, tokenizer.eos_token_id, skip=1).item()
         answer_end = get_sep_position(single_input, tokenizer.eos_token_id, skip=2).item()
 
-        # Incorporate 'Answer:' to question
-        question = single_input[:, :question_end+1+rationale_prefix_len]
-        cot = single_input[:, question_end+1+rationale_prefix_len:cot_end+1] 
+        question = single_input[:, :question_end+1]
+        cot = single_input[:, question_end+1:cot_end+1] 
         answer = single_input[:, cot_end+1:answer_end+1]
 
         # Split CoT into individual rationales
@@ -157,11 +155,15 @@ def process_batch_with_entropy(model, input_ids, labels, tokenizer, max_removes_
 
         assert new_input.shape == new_label.shape, f"Shape of the new_input is {new_input.shape} but the shape of the new label is {new_label.shape}"
 
+        print(f"Truncated Input: {tokenizer.batch_decode(input_ids)}")
+        print(f"Truncated Label: {tokenizer.bathc_decode([t for t in labels if t != -100])}")
+
         new_input_ids.append(new_input.squeeze(0))
         new_labels.append(new_label.squeeze(0))
 
     # Pad sequences to the same length
     new_input_ids = tensorize_batch(new_input_ids)
+    new_input_ids[new_input_ids.lt(0)] = tokenizer.eos_token_id # input_ids do not require the -100
     new_labels = tensorize_batch(new_labels)
 
     return new_input_ids, new_labels
@@ -171,9 +173,7 @@ def evaluate(dataloader, model, tokenizer,  max_new_tokens=512, skip=0, log_pred
     model.eval()
 
     total_instances = 0
-    total_tokens = 0
     total_correct = 0
-    total_correct_tokens = 0
     total_loss = 0
 
     predictions = []
@@ -188,51 +188,46 @@ def evaluate(dataloader, model, tokenizer,  max_new_tokens=512, skip=0, log_pred
             output = model.compute_loss(input_ids=input_ids_all_i.unsqueeze(0), labels=label_i.unsqueeze(0))
             total_loss += output.loss
 
-            # Truncate input_ids_all_i for generation => Generation
-            sep_position = sep_positions[i].item()
-            truncated_input = input_ids_all_i[:sep_position + 1]  # +1 to include the separator token
-            
-            # Generate using the truncated input
-            stop_on_two_eos = True
-            generated_output = model.generate(
-                input_ids=truncated_input.unsqueeze(0),
-                max_new_tokens=max_new_tokens,
-                stop_on_two_eos=stop_on_two_eos,
-            )
-    
-            tgt = input_ids_all_i[sep_position+1:] # Slicing Out CoT;Answer
-            tgt_text = tokenizer.decode(tgt, skip_special_tokens=True)
-            ans = extract_answer(tgt_text)
-            # print(tokenizer.decode(generated_output[0][0], skip_special_tokens=True))
-            # print(tokenizer.decode(generated_output[0][0][sep_position+1:], skip_special_tokens=True))
-            pred_text = tokenizer.decode(generated_output[0][0][sep_position+1:], skip_special_tokens=True)
-            pred_ans = extract_answer(pred_text)
+            if log_predictions and total_instances<3:
+                # Truncate input_ids_all_i for generation => Generation
+                sep_position = sep_positions[i].item()
+                truncated_input = input_ids_all_i[:sep_position + 1]  # +1 to include the separator token
+                
+                # Generate using the truncated input
+                stop_on_two_eos = True
+                generated_output = model.generate(
+                    input_ids=truncated_input.unsqueeze(0),
+                    max_new_tokens=max_new_tokens,
+                    stop_on_two_eos=stop_on_two_eos,
+                )
+        
+                tgt = input_ids_all_i[sep_position+1:] # Slicing Out CoT;Answer
+                tgt_text = tokenizer.decode(tgt, skip_special_tokens=True)
+                ans = extract_answer(tgt_text)
+                pred_text = tokenizer.decode(generated_output[0][0][sep_position+1:], skip_special_tokens=True)
+                pred_ans = extract_answer(pred_text)
 
-            if log_predictions:
+                if ans == pred_text:
+                    total_correct +=0
+
                 predictions.append({
-                    'PPL for Full Instance': output.loss.exp().item(),
-                    'Input': tokenizer.decode(truncated_input, skip_special_tokens=True),
-                    'Target': tgt_text,
-                    'Predicted': pred_text,
-                })
+                        'PPL for Full Instance': output.loss.exp().item(),
+                        'Input': tokenizer.decode(truncated_input, skip_special_tokens=True),
+                        'Target': tgt_text,
+                        'Predicted': pred_text,
+                    })
 
-            if ans == pred_ans:
-                total_correct += 1
+                with open(os.path.join(save_path, f'epoch_{epoch}_predictions.jsonl'), 'w') as f:
+                    for pred in predictions:
+                        json.dump(pred, f)
+                        f.write('\n')
+                    f.write(f"Total Correct : {total_correct/total_instances}")
 
-            total_correct_tokens += 1
             total_instances += 1
 
-    accuracy = total_correct / total_instances
     loss = total_loss / total_instances
 
-    # Save predictions for each epoch
-    if epoch is not None and save_path is not None:
-        with open(os.path.join(save_path, f'epoch_{epoch}_predictions.jsonl'), 'w') as f:
-            for pred in predictions:
-                json.dump(pred, f)
-                f.write('\n')
-
-    return loss, accuracy, predictions
+    return loss, predictions
 
 def main():
     parser = argparse.ArgumentParser()
@@ -241,7 +236,7 @@ def main():
     parser.add_argument('--save_model', type=str, required=True)
     parser.add_argument('--save_data', type=str, required=True)
     parser.add_argument('--base_model', type=str, default='mistralai/Mistral-7B-v0.1')
-    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--warmup_ratio', type=float, default=0.01)
     parser.add_argument('--lr', type=float, default=5e-5)
@@ -299,10 +294,10 @@ def main():
 
     tokenizer = model.tokenizer
     collate_fn = CoTDataCollator(tokenizer)
-    train_dataset = CoTDataset(tokenizer, args.train_path, 512, max_size=-1, is_test=False, train_file=None, num_demonstrations=-1)
+    train_dataset = CoTDataset(tokenizer, args.train_path, 650, max_size=-1, is_test=False, train_file=None, num_demonstrations=-1)
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=local_rank)
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, collate_fn=collate_fn, sampler=train_sampler)
-    val_dataset = CoTDataset(tokenizer, args.val_path, 512,  max_size=-1, is_test=False, train_file=None, num_demonstrations=-1)
+    val_dataset = CoTDataset(tokenizer, args.val_path, 650,  max_size=-1, is_test=False, train_file=None, num_demonstrations=-1)
     val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=local_rank, shuffle=False)
     val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, collate_fn=collate_fn, sampler=val_sampler)
 
@@ -323,7 +318,6 @@ def main():
 
     global_step = 0
     best_val = 999
-    best_accuracy = 0
     best_model_path = os.path.join(args.save_model, 'best_model')
 
     for epoch in range(args.epochs):
@@ -336,9 +330,12 @@ def main():
             labels = batch['labels'].to(local_rank)
 
             #### Remove the rationales after the warmup steps
+            # if global_step/(len(train_dataloader)*args.epoch) > args.warmup_ratio:
             if epoch_step/len(train_dataloader) > args.warmup_ratio:
                 #### Calculate entropy of the rationale and remove the unnecessary part
+                model.eval()
                 input_ids, labels = process_batch_with_entropy(model, input_ids, labels, tokenizer, epoch_step/len(train_dataloader))
+                model.train()
 
             optimizer.zero_grad()
             outputs = model.compute_loss(input_ids=input_ids, labels=labels)
@@ -380,21 +377,19 @@ def main():
 
         model.eval()
         with torch.no_grad():
-            val_loss, accuracy, predictions = evaluate(val_dataloader, model, tokenizer, args.max_new_tokens, skip=0, log_predictions=True, epoch=epoch, save_path=args.save_model)
-            print(f'Accuracy: {accuracy}')
+            val_loss,  predictions = evaluate(val_dataloader, model, tokenizer, args.max_new_tokens, skip=0, log_predictions=True, epoch=epoch, save_path=args.save_model)
             if local_rank == 0:
                 wandb.log({
                     "val_total_loss": val_loss,
-                    "val_accuracy": accuracy,
                     "epoch": epoch
                 })
 
-            # Save the best model based on both loss and accuracy
-            if val_loss < best_val or accuracy > best_accuracy:
+            # Save the best model based on both loss
+            if val_loss < best_val:
                 best_val = min(best_val, val_loss)
-                best_accuracy = max(best_accuracy, accuracy)
-                save_model(local_rank, model, tokenizer, best_model_path, epoch)
-                print(f"New best model saved with loss: {best_val} and accuracy: {best_accuracy}")
+                print(f"New best model saved with loss: {best_val}")
+            
+            save_model(local_rank, model, tokenizer, best_model_path, epoch)
 
         model.train()
 
@@ -405,7 +400,6 @@ def main():
         total_time = (time.time() - start_time) / 3600
         print(f"Training completed. Total time: {total_time:.2f} hours")
         wandb.log({"total_training_time": total_time})
-        print(f"Best model saved with accuracy: {best_accuracy}")
         wandb.finish()
 
     dist.destroy_process_group()

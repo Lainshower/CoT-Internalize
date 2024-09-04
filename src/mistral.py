@@ -43,10 +43,12 @@ class Mistral(nn.Module):
         outputs.total_loss = loss * total_tokens
         outputs.total_tokens = total_tokens
         return outputs
-
+    
+    @torch.no_grad()
     def compute_entropy(self, input_ids, labels, interval):
         outputs = self.forward(input_ids=input_ids, labels=labels, output_hidden_states=True)
         hidden_states = outputs.hidden_states
+        print("Hidden shape", hidden_states.shape)
 
         num_layers = len(hidden_states)
         selected_indices = list(range(0, num_layers, interval))
@@ -62,6 +64,7 @@ class Mistral(nn.Module):
 
         # Stack the results: [num_selected_layers, batch_size]
         cross_entropies = torch.stack(cross_entropies)
+        print("Cross Entropy Shape", cross_entropies.shape)
         
         # Transpose to get [batch_size, num_selected_layers]
         cross_entropies = cross_entropies.t()
@@ -92,15 +95,21 @@ class Mistral(nn.Module):
         
         return sample_cross_entropy  # Shape: [batch_size]
     
-    def generate(self, input_ids, max_new_tokens=512, num_beams=1, stop_on_two_eos=True, test=False):
-        if test == False:
+    def generate(self, input_ids, max_new_tokens=512, num_beams=1, stop_on_two_eos=True, test=False, use_demo=False):
+        if test and use_demo:
             sep_positions = get_sep_position(input_ids, self.tokenizer.eos_token_id)
         else:
             sep_positions = get_sep_position(input_ids, self.tokenizer.eos_token_id, skip=15)
         
         generation_config = GenerationConfig.from_model_config(self.base_model.config)
         
+        # Since there's one eos after CoT and another after final answer, we need to wait for two eos
+        generation_config = GenerationConfig.from_model_config(self.base_model.config)
+        if hasattr(generation_config, 'pad_token_id'):
+            #generation_config.pad_token_id = -1 #TODO: this might not be necessary
+            generation_config.pad_token_id = None #TODO: this might not be necessary
         if stop_on_two_eos:
+            generation_config.eos_token_id = -1
             logits_processor = LogitsProcessorList([DoubleEOSLogitsProcessor(self.tokenizer.eos_token_id)])
             stopping_criteria = StoppingCriteriaList([DoubleEOSStoppingCriteria(self.tokenizer.eos_token_id)])
         else:

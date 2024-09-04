@@ -6,26 +6,26 @@ from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
 def clean_text(text):
-    return text.strip().replace(',', '')
+    return text.strip()
 
 def split_text(text, split_pattern):
     if split_pattern not in text:
         return None, clean_text(text)
     else:
         parts = text.split(split_pattern, 1)
-        return clean_text(parts[0]), clean_text(parts[1])
+        return clean_text(parts[0]), clean_text(parts[1]).replace(',', '')
 
-def extract_answer_w_prefix(text):
+def extract_answer_w_prefix(text, prefix='####'):
     _, ans = split_text(text, '####')
-    return f"The answer is {ans}." if '####' in text else ans
+    return prefix + ans
 
-def extract_answer(text):
-    _, ans = split_text(text, 'The answer is')
-    return ans.replace('.', '') if 'The answer is' in text else ans
+def extract_answer(text, prefix):
+    _, ans = split_text(text, prefix)
+    return ans
 
-def extract_cot_w_prefix(text):
+def extract_cot_w_prefix(text, prefix=""):
     cot, _ = split_text(text, '####')
-    return f"Answer: {cot}" if cot else None
+    return prefix + cot
 
 class CoTDataset(Dataset):
     def __init__(self, tokenizer, file_path: str, max_length: int, max_size=-1, is_test=False, train_file='data/gsm8k/train_orig', num_demonstrations=5):
@@ -42,7 +42,7 @@ class CoTDataset(Dataset):
         self.examples = self.load_and_process_file(file_path, max_size)
         self.separator = tokenizer.eos_token_id
 
-        if is_test and train_file:
+        if is_test and train_file and num_demonstrations>0:
             self.train_examples = self.load_and_process_file(train_file, max_size)
             self.demonstrations = self.get_random_demonstration()
         else:
@@ -78,8 +78,10 @@ class CoTDataset(Dataset):
     def __getitem__(self, i):
         if self.is_test:
             example = self.examples[i]
-            input_text = (f"{self.demonstrations} {example['src']} {self.eos_token} "
-                          f"{example['cot']} {self.eos_token} {example['ans']} {self.eos_token}")
+            if self.train_file and self.num_demonstrations>0:
+                input_text = f"{self.demonstrations} {example['src']} {self.eos_token} {example['cot']} {self.eos_token} {example['ans']} {self.eos_token}"
+            else:
+                input_text = f"{example['src']} {self.eos_token} {example['cot']} {self.eos_token} {example['ans']} {self.eos_token}"
         else:
             example = self.examples[i]
             input_text = f"{example['src']} {self.eos_token} {example['cot']} {self.eos_token} {example['ans']} {self.eos_token}"

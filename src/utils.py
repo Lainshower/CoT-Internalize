@@ -61,6 +61,8 @@ def split_rationale(rationale, tokenizer):
     if start < rationale.size(1):
         sentences.append(rationale[:, start:])
     
+    print(sentences)
+
     return sentences
 
 '''

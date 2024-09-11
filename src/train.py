@@ -79,7 +79,7 @@ def check_entropy(model, input_sequence, label_sequence, hidden_improve, hidden_
     return compute_entropy_improvement(datum_entropies, threshold=hidden_improve, k_percent=0.6)
 
 @torch.no_grad()
-def process_rationales(model, question, rationales, cot_end_idx, single_label, max_removes_ratio, hidden_improve, hidden_interval):
+def process_rationales(model, question, rationales, cot_end_idx, single_label, current_train_ratio, hidden_improve, hidden_interval, local_rank):
     """
     Process rationales based on entropy improvement, limiting discards based on training progress.
     Ensures consistency between input and label removals.
@@ -94,9 +94,9 @@ def process_rationales(model, question, rationales, cot_end_idx, single_label, m
     removed_indices = []
     label_start_idx = question.size(1)
 
-    max_removes = max_removes_ratio * len(rationales)
-    while i < len(rationales) and removed < max_removes:
-        print("REMOVE TEST?!", i, removed, max_removes)
+    max_removes_per_rationales = round((current_train_ratio) * len(rationales))
+    while i < len(rationales) and removed < max_removes_per_rationales:
+        print(f"REMOVE TEST ==  RATIOANLE SENTENCE : {i} | LOCAL RANK: {local_rank} | REMOVED: {removed} | MAXIMUM REMOVAL: {max_removes_per_rationales}")
         rationale_size = rationales[i].size(1)
 
         # Prepend rationale sentence to the input
@@ -124,7 +124,7 @@ def process_rationales(model, question, rationales, cot_end_idx, single_label, m
 
     return current_input, current_label, removed_indices
 
-def process_batch_with_entropy(model, input_ids, labels, tokenizer, max_removes_ratio, hidden_improve, hidden_interval, local_rank):
+def process_batch_with_entropy(model, input_ids, labels, tokenizer, current_train_ratio, hidden_improve, hidden_interval, local_rank):
     """
     Process the batch with step-by-step entropy-based CoT removal.
     """
@@ -151,12 +151,11 @@ def process_batch_with_entropy(model, input_ids, labels, tokenizer, max_removes_
 
         # Split CoT into individual rationales
         rationales = split_rationale(cot, tokenizer)
-        if local_rank == 0 and i==0:
-            print(rationales)
 
         # Process rationales
-        processed_input, processed_label, removed_indices = process_rationales(model, question, rationales, cot_end+1, single_label, max_removes_ratio, hidden_improve, hidden_interval)
-        print(removed_indices)
+        processed_input, processed_label, removed_indices = process_rationales(model, question, rationales, cot_end+1, single_label, current_train_ratio, hidden_improve, hidden_interval, local_rank)
+        if local_rank == 0 and i==0:
+            print(rationales, removed_indices)
 
         # Add answer to the final input
         new_input = torch.cat([processed_input, answer], dim=1)
@@ -344,17 +343,20 @@ def main():
 
             before_shape = input_ids.shape
             #### Remove the rationales after the warmup steps
-            # if global_step/(len(train_dataloader)*args.epoch) > args.warmup_ratio:
-            if global_step/total_steps > args.warmup_ratio:
+            current_train_ratio = global_step/total_steps
+            if current_train_ratio > args.warmup_ratio:
                 #### Calculate entropy of the rationale and remove the unnecessary part
-                input_ids, labels = process_batch_with_entropy(model, input_ids, labels, tokenizer, global_step/total_steps, args.hidden_improve, args.hidden_interval, local_rank)
-                if before_shape != input_ids[0]:
+                input_ids, labels = process_batch_with_entropy(model, input_ids, labels, tokenizer, current_train_ratio, args.hidden_improve, args.hidden_interval, local_rank)
+                if before_shape != input_ids.shape:
+                    print(f"BEFORE SHAPE: {before_shape} | AFTER SHAPE: {input_ids.shape}")
+                    optimizer.zero_grad(set_to_none=True)
                     del optimizer
                     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, **extra_args)
 
 
             outputs = model.compute_loss(input_ids=input_ids, labels=labels)
             loss = outputs.loss
+            # torch.distributed.barrier()
             print("Loss", loss)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
@@ -369,7 +371,6 @@ def main():
                 else:
                     print(f"Layer: {name} | Gradient Norm: {param.grad.norm()}")
             optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
 
             if local_rank == 0 and epoch_step%50 == 0:
                 training_step_data = []

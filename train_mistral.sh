@@ -6,12 +6,12 @@ NUM_GPUS=3
 # Set your parameters
 TRAIN_PATH="data/gsm8k/train_orig.txt"
 VAL_PATH="data/gsm8k/valid_orig.txt"
-export SAVE_M="mistral-optimizer-shift/gsm8k_entropy"
-export SAVE_D="mistral-optimizer-shift/gsm8k-training-data"
+export SAVE_M="mistral/gsm8k_entropy"
+export SAVE_D="mistral/gsm8k-training-data"
 BASE_MODEL="mistralai/Mistral-7B-v0.1"
 EPOCHS=1
-BATCH_SIZE=4
-WARM_UP=0.3 #0.2
+BATCH_SIZE=3
+WARM_UP=0.2 #0.2
 LEARNING_RATE=5e-5
 ACUMULATE=1
 GRAD_NORM=1.0

@@ -44,11 +44,21 @@ class Mistral(nn.Module):
         outputs.total_tokens = total_tokens
         return outputs
     
-    @torch.no_grad()
     def compute_entropy(self, input_ids, labels, interval):
-        outputs = self.forward(input_ids=input_ids, labels=labels, output_hidden_states=True)
+        with torch.no_grad():
+            outputs = self.forward(input_ids=input_ids, labels=labels, output_hidden_states=True)
         hidden_states = outputs.hidden_states
-        print("Hidden shape", hidden_states.shape)
+
+        # print("Last Hidden_states")
+        # print(hidden_states[-1])
+
+        for name, param in self.base_model.named_parameters():
+            if param is None:
+                print("NAN VALUE IS DETECTED")
+                print(f"Layer: {name} | Param: {param}")
+                exit()
+            else:
+                pass
 
         num_layers = len(hidden_states)
         selected_indices = list(range(0, num_layers, interval))
@@ -58,16 +68,17 @@ class Mistral(nn.Module):
         cross_entropies = []
         for i in selected_indices:
             layer_hidden = hidden_states[i]  # Shape: [batch_size, seq_len, hidden_size]
-            layer_logits = self.lm_head(layer_hidden)  # Shape: [batch_size, seq_len, vocab_size]
-            layer_cross_entropy = self.calculate_entropy(layer_logits, input_ids)
+            with torch.no_grad():
+                layer_logits = self.lm_head(layer_hidden)  # Shape: [batch_size, seq_len, vocab_size]
+                layer_cross_entropy = self.calculate_entropy(layer_logits, input_ids)
             cross_entropies.append(layer_cross_entropy)
 
         # Stack the results: [num_selected_layers, batch_size]
         cross_entropies = torch.stack(cross_entropies)
-        print("Cross Entropy Shape", cross_entropies.shape)
-        
+
         # Transpose to get [batch_size, num_selected_layers]
         cross_entropies = cross_entropies.t()
+        print("Cross Entropy List", cross_entropies)
 
         outputs.cross_entropies = cross_entropies
         return outputs
@@ -97,9 +108,9 @@ class Mistral(nn.Module):
     
     def generate(self, input_ids, max_new_tokens=512, num_beams=1, stop_on_two_eos=True, test=False, use_demo=False):
         if test and use_demo:
-            sep_positions = get_sep_position(input_ids, self.tokenizer.eos_token_id)
-        else:
             sep_positions = get_sep_position(input_ids, self.tokenizer.eos_token_id, skip=15)
+        else:
+            sep_positions = get_sep_position(input_ids, self.tokenizer.eos_token_id)
         
         generation_config = GenerationConfig.from_model_config(self.base_model.config)
         

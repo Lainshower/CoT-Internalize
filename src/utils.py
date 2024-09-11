@@ -32,19 +32,37 @@ def tensorize_batch(examples):
 ENTROPY CALCULATION
 '''
 
-def compute_entropy_improvement(entropies, threshold=0.7):
+def compute_entropy_improvement(entropies, threshold=0.6, k_percent=0.5):
     """
     Compute if entropy shows an increasing trend across layers.
-    Returns True if entropy increases for the majority of layer transitions.
+    Returns True if an entropy is greater than k_percent of all previous entropies
+    for the majority of layer transitions.
+    
+    :param entropies: List of entropy values for each layer
+    :param threshold: Minimum ratio of improvements required (default: 0.6)
+    :param k_percent: Percentage threshold for comparison (default: 0.8)
+    :return: Boolean indicating if entropy shows an increasing trend
     """
-    increases = [entropies[i] < entropies[i+1] for i in range(len(entropies)-1)]
-    return sum(increases) / len(increases) >= threshold
+    improvements = []
+    
+    for i in range(1, len(entropies)):
+        current_entropy = entropies[i]
+        previous_entropies = entropies[:i]
+        
+        better_count = sum(1 for prev in previous_entropies if current_entropy < prev)
+        
+        is_improved = (better_count / len(previous_entropies)) >= k_percent
+        improvements.append(is_improved)
+    
+    improvement_ratio = sum(improvements) / len(improvements)
+    
+    return improvement_ratio >= threshold
 
 def split_rationale(rationale, tokenizer):
     """
     Split the rationale into sentences based on splitters.
     """
-    sentence_splitters = [tokenizer.convert_tokens_to_ids(t) for t in ['.', '!', '?']]
+    sentence_splitters = [tokenizer.convert_tokens_to_ids(t) for t in ['.']]
     sentence_ends = [i for i, token in enumerate(rationale[0]) if token in sentence_splitters]
     
     if not sentence_ends:
@@ -59,11 +77,10 @@ def split_rationale(rationale, tokenizer):
     
     # Add any remaining text after the last sentence splitter
     if start < rationale.size(1):
-        sentences.append(rationale[:, start:])
-    
-    print(sentences)
+        sentences[-1] = torch.cat([sentences[-1], rationale[:, start:]], dim=1)
 
     return sentences
+
 
 '''
 GENERATION UTILS

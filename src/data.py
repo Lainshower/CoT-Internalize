@@ -94,13 +94,8 @@ class CoTDataset(Dataset):
         input_ids = encoding["input_ids"]
         labels = copy.deepcopy(input_ids)
 
-        if not self.is_test:
-            sep_idx = labels.index(self.separator) + 1
-            labels[:sep_idx] = [-100] * sep_idx
-
-            if i <3:
-                print(f"Input: {self.tokenizer.decode(input_ids)}")
-                print(f"Label: {self.tokenizer.decode([t for t in labels if t != -100])}")
+        sep_idx = labels.index(self.separator) + 1
+        labels[:sep_idx] = [-100] * sep_idx
 
         return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
     

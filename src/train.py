@@ -73,11 +73,13 @@ def save_model(local_rank, model, tokenizer, model_dir, current_epoch):
         model.save_pretrained(outpath, state_dict=state_dict)
         tokenizer.save_pretrained(outpath)
 
-def check_entropy(model, input_sequence, label_sequence):
-    entropies = model.compute_entropy(input_sequence, label_sequence, interval=4).cross_entropies[0]
-    return compute_entropy_improvement(entropies)
+def check_entropy(model, input_sequence, label_sequence, hidden_improve, hidden_interval):
+    outputs = model.compute_entropy(input_sequence, label_sequence, interval=hidden_interval)
+    datum_entropies = outputs.cross_entropies[0]
+    return compute_entropy_improvement(datum_entropies, threshold=hidden_improve, k_percent=0.6)
 
-def process_rationales(model, question, rationales, single_label, max_removes_ratio):
+@torch.no_grad()
+def process_rationales(model, question, rationales, cot_end_idx, single_label, max_removes_ratio, hidden_improve, hidden_interval):
     """
     Process rationales based on entropy improvement, limiting discards based on training progress.
     Ensures consistency between input and label removals.
@@ -92,8 +94,9 @@ def process_rationales(model, question, rationales, single_label, max_removes_ra
     removed_indices = []
     label_start_idx = question.size(1)
 
-    max_removes = round(max_removes_ratio * len(rationales))
+    max_removes = max_removes_ratio * len(rationales)
     while i < len(rationales) and removed < max_removes:
+        print("REMOVE TEST?!", i, removed, max_removes)
         rationale_size = rationales[i].size(1)
 
         # Prepend rationale sentence to the input
@@ -102,7 +105,7 @@ def process_rationales(model, question, rationales, single_label, max_removes_ra
         # Prepend corresponding rationale index to the test
         test_label = torch.cat([current_label, single_label[:, label_start_idx:label_start_idx + rationale_size]], dim=1)
 
-        if check_entropy(model, test_input, test_label):
+        if check_entropy(model, test_input, test_label, hidden_improve, hidden_interval):
             current_input = test_input
             current_label = test_label
         else:
@@ -115,13 +118,13 @@ def process_rationales(model, question, rationales, single_label, max_removes_ra
     # Add remaining rationales if any
     if i < len(rationales):
         remaining_input = torch.cat(rationales[i:], dim=1)
-        remaining_label = single_label[:, label_start_idx:]
+        remaining_label = single_label[:, label_start_idx:cot_end_idx]
         current_input = torch.cat([current_input, remaining_input], dim=1)
         current_label = torch.cat([current_label, remaining_label], dim=1)
 
     return current_input, current_label, removed_indices
 
-def process_batch_with_entropy(model, input_ids, labels, tokenizer, max_removes_ratio):
+def process_batch_with_entropy(model, input_ids, labels, tokenizer, max_removes_ratio, hidden_improve, hidden_interval, local_rank):
     """
     Process the batch with step-by-step entropy-based CoT removal.
     """
@@ -129,13 +132,18 @@ def process_batch_with_entropy(model, input_ids, labels, tokenizer, max_removes_
     new_input_ids = []
     new_labels = []
 
+    if local_rank == 0:
+        print("Before Process")
+        print("B-INPUT", input_ids[0])
+        print("B-LABEL", labels[0])
+
     for i in range(batch_size):
         single_input = input_ids[i].unsqueeze(0)
         single_label = labels[i].unsqueeze(0)
 
-        question_end = get_sep_position(single_input, tokenizer.eos_token_id, skip=0).item()
-        cot_end = get_sep_position(single_input, tokenizer.eos_token_id, skip=1).item()
-        answer_end = get_sep_position(single_input, tokenizer.eos_token_id, skip=2).item()
+        question_end = get_sep_position(single_input, tokenizer.eos_token_id, skip=0).item() # get the item from the list
+        cot_end = get_sep_position(single_input, tokenizer.eos_token_id, skip=1).item() # get the item from the list
+        answer_end = get_sep_position(single_input, tokenizer.eos_token_id, skip=2).item() # get the item from the list
 
         question = single_input[:, :question_end+1]
         cot = single_input[:, question_end+1:cot_end+1] 
@@ -143,9 +151,12 @@ def process_batch_with_entropy(model, input_ids, labels, tokenizer, max_removes_
 
         # Split CoT into individual rationales
         rationales = split_rationale(cot, tokenizer)
+        if local_rank == 0 and i==0:
+            print(rationales)
 
         # Process rationales
-        processed_input, processed_label, removed_indices = process_rationales(model, question, rationales, single_label, max_removes_ratio)
+        processed_input, processed_label, removed_indices = process_rationales(model, question, rationales, cot_end+1, single_label, max_removes_ratio, hidden_improve, hidden_interval)
+        print(removed_indices)
 
         # Add answer to the final input
         new_input = torch.cat([processed_input, answer], dim=1)
@@ -155,9 +166,6 @@ def process_batch_with_entropy(model, input_ids, labels, tokenizer, max_removes_
 
         assert new_input.shape == new_label.shape, f"Shape of the new_input is {new_input.shape} but the shape of the new label is {new_label.shape}"
 
-        print(f"Truncated Input: {tokenizer.batch_decode(input_ids)}")
-        print(f"Truncated Label: {tokenizer.bathc_decode([t for t in labels if t != -100])}")
-
         new_input_ids.append(new_input.squeeze(0))
         new_labels.append(new_label.squeeze(0))
 
@@ -165,6 +173,11 @@ def process_batch_with_entropy(model, input_ids, labels, tokenizer, max_removes_
     new_input_ids = tensorize_batch(new_input_ids)
     new_input_ids[new_input_ids.lt(0)] = tokenizer.eos_token_id # input_ids do not require the -100
     new_labels = tensorize_batch(new_labels)
+
+    if local_rank == 0:
+        print("After Process")
+        print("A-INPUT", new_input_ids[0])
+        print("A-LABEL", new_labels[0])
 
     return new_input_ids, new_labels
 
@@ -203,9 +216,9 @@ def evaluate(dataloader, model, tokenizer,  max_new_tokens=512, skip=0, log_pred
         
                 tgt = input_ids_all_i[sep_position+1:] # Slicing Out CoT;Answer
                 tgt_text = tokenizer.decode(tgt, skip_special_tokens=True)
-                ans = extract_answer(tgt_text)
+                ans = extract_answer(tgt_text, prefix='####')
                 pred_text = tokenizer.decode(generated_output[0][0][sep_position+1:], skip_special_tokens=True)
-                pred_ans = extract_answer(pred_text)
+                pred_ans = extract_answer(pred_text, prefix='####')
 
                 if ans == pred_text:
                     total_correct +=0
@@ -217,13 +230,12 @@ def evaluate(dataloader, model, tokenizer,  max_new_tokens=512, skip=0, log_pred
                         'Predicted': pred_text,
                     })
 
-                with open(os.path.join(save_path, f'epoch_{epoch}_predictions.jsonl'), 'w') as f:
-                    for pred in predictions:
-                        json.dump(pred, f)
-                        f.write('\n')
-                    f.write(f"Total Correct : {total_correct/total_instances}")
-
             total_instances += 1
+    
+    with open(os.path.join(save_path, f'epoch_{epoch}_predictions.jsonl'), 'w') as f:
+        for pred in predictions:
+            json.dump(pred, f)
+            f.write('\n')
 
     loss = total_loss / total_instances
 
@@ -239,6 +251,8 @@ def main():
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--warmup_ratio', type=float, default=0.01)
+    parser.add_argument('--hidden_improve', type=float, default=0.5)
+    parser.add_argument('--hidden_interval', type=float, default=4)
     parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--accumulate', type=int, default=1)
     parser.add_argument('--max_grad_norm', type=float, default=1.0)
@@ -253,6 +267,8 @@ def main():
     dtype = 'float32'
     if args.bf16:
         dtype = 'bfloat16'
+    else:
+        dtype = 'float32'
     ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -271,7 +287,7 @@ def main():
 
     if local_rank == 0:
         wandb.init(
-            project="Mistral-GSM8K",
+            project="Mistral-GSM8K-ENTROPY",
             name=f"learning_config_ep{args.epochs}_bsz{args.batch_size}_lr{args.lr}",
             config=args
         )
@@ -309,14 +325,11 @@ def main():
     extra_args = dict(fused=True) if use_fused else dict()
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, **extra_args)
 
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)   
-
     model.train()
     start_time = time.time()
     max_training_time = 24 * 60 * 60  # 24 hours in seconds
 
-    global_step = 0
+    global_step = 1
     best_val = 999
     best_model_path = os.path.join(args.save_model, 'best_model')
 
@@ -329,30 +342,41 @@ def main():
             input_ids = batch['input_ids'].to(local_rank)
             labels = batch['labels'].to(local_rank)
 
+            before_shape = input_ids.shape
             #### Remove the rationales after the warmup steps
             # if global_step/(len(train_dataloader)*args.epoch) > args.warmup_ratio:
-            if epoch_step/len(train_dataloader) > args.warmup_ratio:
+            if global_step/total_steps > args.warmup_ratio:
                 #### Calculate entropy of the rationale and remove the unnecessary part
-                model.eval()
-                input_ids, labels = process_batch_with_entropy(model, input_ids, labels, tokenizer, epoch_step/len(train_dataloader))
-                model.train()
+                input_ids, labels = process_batch_with_entropy(model, input_ids, labels, tokenizer, global_step/total_steps, args.hidden_improve, args.hidden_interval, local_rank)
+                if before_shape != input_ids[0]:
+                    del optimizer
+                    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, **extra_args)
 
-            optimizer.zero_grad()
+
             outputs = model.compute_loss(input_ids=input_ids, labels=labels)
             loss = outputs.loss
-            loss.div(args.accumulate).backward()
-            if global_step % args.accumulate == 0 or global_step % len(train_dataloader)==0:
-                torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
+            print("Loss", loss)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
+            # if (global_step) % args.accumulate == 0 or (global_step) % len(train_dataloader)==0:
+            #     # torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
+            for name, param in model.named_parameters():
+                if torch.isnan(param.grad).any():
+                        print(f"Layer: {name} | Gradient contains NaN")
+                        print(f"Gradient Norm: {param.grad.norm()}")
+                        print(f"Gradient: {param.grad}")
+                        exit()
+                else:
+                    print(f"Layer: {name} | Gradient Norm: {param.grad.norm()}")
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
-            if local_rank == 0 and epoch_step%100:
+            if local_rank == 0 and epoch_step%50 == 0:
                 training_step_data = []
                 for input_, label_ in zip(input_ids, labels):
-                    predictions.append({
-                        'Input': tokenizer.decode(input_, skip_special_tokens=True),
-                        'Target': tokenizer.decode(label_, skip_special_tokens=True),
+                    training_step_data.append({
+                        'Input': tokenizer.decode(input_.tolist(), skip_special_tokens=True),
+                        'Target': tokenizer.decode([t for t in label_.tolist() if t != -100], skip_special_tokens=True),
                     })
                 with open(os.path.join(args.save_data, f'epoch_{epoch}_trainig-step_{epoch_step}_data.jsonl'), 'w') as f:
                     for datum in training_step_data:

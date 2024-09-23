@@ -17,7 +17,7 @@ def split_text(text, split_pattern):
 
 def extract_answer_w_prefix(text, prefix='####'):
     _, ans = split_text(text, '####')
-    return prefix + ans
+    return prefix + " " + ans
 
 def extract_answer(text, prefix):
     _, ans = split_text(text, prefix)
@@ -97,7 +97,7 @@ class CoTDataset(Dataset):
         sep_idx = labels.index(self.separator) + 1
         labels[:sep_idx] = [-100] * sep_idx
 
-        return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
+        return (torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long))
     
     def get_random_demonstration(self):
         import random

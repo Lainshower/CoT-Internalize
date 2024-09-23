@@ -28,3 +28,4 @@ Thumbs.db
 !data/gsm8k/train.txt
 data/*
 mistral/
+wandb/

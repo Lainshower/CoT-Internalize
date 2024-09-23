@@ -33,6 +33,14 @@ class Mistral(nn.Module):
         token_accuracy = correct_tokens / total_tokens
 
         shift_logits = logits[..., :-1, :].contiguous()
+        '''
+        Verify the Gradient
+        shift_logits = shift_logits - shift_logits.max(dim=-1, keepdim=True)[0]
+        '''
+        print('Logits min:', shift_logits.min())
+        print('Logits max:', shift_logits.max())
+        print('Logits mean:', shift_logits.mean())
+
         shift_labels = labels[..., 1:].contiguous()
         loss_fct = CrossEntropyLoss(ignore_index=-100)
         loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))

@@ -16,6 +16,7 @@ def evaluate(device, dataloader, model, tokenizer, max_new_tokens=512, skip=0, l
     total_instances = 0
     total_correct = 0
     total_loss = 0
+    total_generated_len = 0 
 
     predictions = []
 
@@ -41,15 +42,21 @@ def evaluate(device, dataloader, model, tokenizer, max_new_tokens=512, skip=0, l
                     max_new_tokens=max_new_tokens,
                     stop_on_two_eos=stop_on_two_eos,
                 )
-        
+
+                # Label 
                 tgt = input_ids_all_i[sep_position+1:]  # Slicing Out CoT;Answer
                 tgt_text = tokenizer.decode(tgt, skip_special_tokens=True)
                 ans = extract_answer(tgt_text, prefix='####')
-                pred_text = tokenizer.decode(generated_output[0][0][sep_position+1:], skip_special_tokens=True)
+
+                # Predictions
+                generated_tokens = generated_output[0][0][sep_position+1:]  # Slicing Out CoT;Answer
+
+                pred_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                total_generated_len += len(tokenizer.tokenize(pred_text))
                 pred_ans = extract_answer(pred_text, prefix='####')
 
                 if ans == pred_ans:
-                    total_correct += 0
+                    total_correct += 1
 
                 predictions.append({
                         'PPL for Full Instance': output.loss.exp().item(),
@@ -58,6 +65,7 @@ def evaluate(device, dataloader, model, tokenizer, max_new_tokens=512, skip=0, l
                         'Predicted': pred_text,
                         'Target Ans': ans,
                         'Predicted Ans': pred_ans,
+                        'Generated Tokens Length': len(tokenizer.tokenize(pred_text)),
                     })
 
             total_instances += 1
@@ -69,8 +77,9 @@ def evaluate(device, dataloader, model, tokenizer, max_new_tokens=512, skip=0, l
 
     loss = total_loss / total_instances
     accuracy = total_correct / total_instances
+    avg_generated_len = total_generated_len / total_instances 
 
-    return loss, accuracy, predictions
+    return loss, accuracy, avg_generated_len, predictions
 
 def main():
     parser = argparse.ArgumentParser()
@@ -99,7 +108,7 @@ def main():
 
     # Evaluate
     with torch.no_grad():
-        val_loss, accuracy, predictions = evaluate(
+        val_loss, accuracy, avg_generated_len, redictions = evaluate(
             device,
             val_dataloader,
             model,
@@ -110,9 +119,10 @@ def main():
             save_path=args.save_path
         )
 
-    print(f"Validation Loss: {val_loss}")
+    print(f"Evaluation Loss: {val_loss}")
     print(f"Perplexity: {torch.exp(torch.tensor(val_loss)).item()}")
-    print(f"Validation Accuacy: {accuracy}")
+    print(f"Average Generated Tokens: {avg_generated_len}")
+    print(f"Evaluation Accuacy: {accuracy}")
 
 if __name__ == "__main__":
     main()

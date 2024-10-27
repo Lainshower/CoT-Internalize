@@ -51,13 +51,13 @@ def save_model(model, tokenizer, model_dir, current_epoch):
     model.save_pretrained(outpath)
     tokenizer.save_pretrained(outpath)
 
-def check_entropy(model, input_sequence, label_sequence, hidden_improve, hidden_interval):
-    outputs = model.compute_entropy(input_sequence, label_sequence, interval=hidden_interval)
+def check_entropy(model, input_sequence, label_sequence, return_tokens, hidden_improve, hidden_interval, improved_ratio):
+    outputs = model.compute_entropy(input_sequence, label_sequence, interval=hidden_interval, return_seq=return_tokens)
     datum_entropies = outputs.cross_entropies[0]
-    return datum_entropies, compute_entropy_improvement(datum_entropies, threshold=hidden_improve, k_percent=0.6)
+    return datum_entropies, compute_entropy_improvement(datum_entropies, threshold=hidden_improve, improved_ratio=improved_ratio, return_seq=return_tokens)
 
 @torch.no_grad()
-def process_rationales(model, question, rationales, cot_end_idx, single_label, current_train_ratio, hidden_improve, hidden_interval, device):
+def process_rationales(model, question, rationales, cot_end_idx, single_label, current_train_ratio, return_tokens, hidden_improve, hidden_interval, improved_ratio, device):
     """
     Process rationales based on entropy improvement, limiting discards based on training progress.
     Ensures consistency between input and label removals.
@@ -84,7 +84,7 @@ def process_rationales(model, question, rationales, cot_end_idx, single_label, c
         # Append corresponding rationale index to the test
         test_label = torch.cat([current_label, single_label[:, label_start_idx:label_start_idx + rationale_size]], dim=1)
 
-        i_rationale_entropies, improve = check_entropy(model, test_input, test_label, hidden_improve, hidden_interval)
+        i_rationale_entropies, improve = check_entropy(model, test_input, test_label, return_tokens, hidden_improve, hidden_interval, improved_ratio)
         rationale_entropies.append(i_rationale_entropies)
         if improve:
             current_input = test_input
@@ -109,7 +109,7 @@ def process_rationales(model, question, rationales, cot_end_idx, single_label, c
 
     return current_input, current_label, removed_indices, rationale_entropies
 
-def process_batch_with_entropy(model, input_ids, labels, tokenizer, current_train_ratio, hidden_improve, hidden_interval, device, epoch, training_step):
+def process_batch_with_entropy(model, input_ids, labels, tokenizer, current_train_ratio, return_tokens, hidden_improve, improved_ratio, hidden_interval, device, epoch, training_step):
     batch_size = input_ids.size(0)
     new_input_ids = []
     new_labels = []
@@ -132,8 +132,8 @@ def process_batch_with_entropy(model, input_ids, labels, tokenizer, current_trai
 
         # Process rationales
         processed_input, processed_label, removed_indices, rationale_entropies = process_rationales(
-            model, question, rationales, cot_end+1, single_label, current_train_ratio,
-            hidden_improve, hidden_interval, device
+            model, question, rationales, cot_end+1, single_label, current_train_ratio, return_tokens,
+            hidden_improve, hidden_interval, improved_ratio, device
         )
         
         # Add answer to the final input
@@ -158,10 +158,11 @@ def process_batch_with_entropy(model, input_ids, labels, tokenizer, current_trai
             'new_labels': tokenizer.decode([t for t in new_label.squeeze(0).tolist() if t != -100], skip_special_tokens=True),
         }
 
-        for j, entropy in enumerate(zip(rationale_entropies)):
-            datum_data[f"{j}'s rationale entropies"] = entropy
+        for j, entropy in enumerate(rationale_entropies):  
+            datum_data[f"{j}'s rationale entropies"] = entropy.tolist()
             datum_data[f"{j}'s rationale removed"] = j in removed_indices
 
+        print(datum_data)
         batch_data.append(datum_data)
 
         # Clear GPU cache after processing each sample
@@ -213,7 +214,7 @@ def evaluate(device, dataloader, model, tokenizer, max_new_tokens=512, skip=0, l
                 pred_text = tokenizer.decode(generated_output[0][0][sep_position+1:], skip_special_tokens=True)
                 pred_ans = extract_answer(pred_text, prefix='####')
 
-                if ans == pred_text:
+                if ans == pred_ans:
                     total_correct += 0
 
                 predictions.append({
@@ -284,9 +285,11 @@ def main():
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--warmup_ratio', type=float, default=0.01)
-    parser.add_argument('--hidden_improve', type=float, default=0.5)
-    parser.add_argument('--loss_scale', type=float, default=0.7)
-    parser.add_argument('--hidden_interval', type=float, default=4)
+    parser.add_argument('--return_tokens', action='store_true')
+    parser.add_argument('--hidden_improve', type=float, default=0.7)
+    parser.add_argument('--improved_ratio', type=float, default=0.7)
+    parser.add_argument('--hidden_interval', type=int, default=4)
+    parser.add_argument('--train_orig', action='store_true', default=False)
     parser.add_argument('--lr', type=float, default=5e-5)
     parser.add_argument('--weight_decay', type=float, default=0.01, help='Weight decay for optimizer')
     parser.add_argument('--accumulate', type=int, default=1)
@@ -383,29 +386,29 @@ def main():
             ### Cache the pre-ratioanle removed data shape
             bef_process_shape = input_ids.shape
 
-            # ### Remove the rationales after the warmup steps
-            # current_train_ratio = global_step/total_steps
-            # if current_train_ratio > args.warmup_ratio:
+            ### Remove the rationales after the warmup steps
+            current_train_ratio = global_step/total_steps
+            if current_train_ratio > args.warmup_ratio and not args.train_orig:
 
-            #     ### Calculate entropy of each rationale and remove the unnecessary sentence
-            #     input_ids, labels, batch_data =  process_batch_with_entropy(model, input_ids, labels, tokenizer, current_train_ratio, args.hidden_improve, args.hidden_interval, device, epoch, training_step)
-            #     if bef_process_shape != input_ids.shape: # and prev_batch_seq != input_ids.shape[-1]
-            #         print(f"BEFORE SHAPE: {bef_process_shape} | AFTER SHAPE: {input_ids.shape}")
-            #         optimizer.zero_grad(set_to_none=True)
-            #         del optimizer, scheduler
-            #         del optimizer
-            #         optimizer = get_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
-            #         scheduler = get_linear_schedule_with_warmup(
-            #             optimizer,
-            #             num_warmup_steps=0,
-            #             num_training_steps=total_steps-global_step
-            #         )
+                ### Calculate entropy of each rationale and remove the unnecessary sentence
+                input_ids, labels, batch_data = process_batch_with_entropy(model, input_ids, labels, tokenizer, current_train_ratio, args.return_tokens, args.hidden_improve, args.improved_ratio, args.hidden_interval, device, epoch, epoch_step)
+                if bef_process_shape != input_ids.shape: # and prev_batch_seq != input_ids.shape[-1]
+                    print(f"BEFORE SHAPE: {bef_process_shape} | AFTER SHAPE: {input_ids.shape}")
+                    optimizer.zero_grad(set_to_none=True)
+                    # del optimizer, scheduler
+                    del optimizer
+                    optimizer = get_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
+                    # scheduler = get_linear_schedule_with_warmup(
+                    #     optimizer,
+                    #     num_warmup_steps=0,
+                    #     num_training_steps=total_steps-global_step
+                    # )
                 
-            #     # Save batch_data to a file
-            #     with open(os.path.join(args.save_data, f'epoch_{epoch}_entropy_data.jsonl'), 'a') as f:
-            #         for data in batch_data:
-            #             json.dump(data, f)
-            #             f.write('\n')
+                # Save batch_data to a file
+                with open(os.path.join(args.save_data, f'epoch_{epoch}_entropy_data.jsonl'), 'a') as f:
+                    for data in batch_data:
+                        json.dump(data, f)
+                        f.write('\n')
 
             # Before forward pass memory
             print_memory_usage("Before Forward Pass")
@@ -486,7 +489,7 @@ def main():
             if val_loss < best_val:
                 best_val = val_loss
                 print(f"New best model saved with loss: {best_val}")
-                save_model(model, tokenizer, best_model_path, epoch)
+            save_model(model, tokenizer, best_model_path, epoch)
 
         model.train()
 

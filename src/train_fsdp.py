@@ -402,39 +402,44 @@ def main():
             input_ids = batch['input_ids'].to(local_rank)
             labels = batch['labels'].to(local_rank)
 
-            # if prev_batch_seq == None:
-            #     prev_batch_seq = input_ids.shape[-1]
-            # bef_process_shape = input_ids.shape
-            # #### Remove the rationales after the warmup steps
-            # current_train_ratio = global_step/total_steps
-            # if current_train_ratio > args.warmup_ratio:
-            #     #### Calculate entropy of the rationale and remove the unnecessary part
-            #     input_ids, labels = process_batch_with_entropy(model, input_ids, labels, tokenizer, current_train_ratio, args.hidden_improve, args.hidden_interval, local_rank)
-            #     if bef_process_shape != input_ids.shape and prev_batch_seq != input_ids.shape[-1]:
-            #         print(f"BEFORE SHAPE: {bef_process_shape} | AFTER SHAPE: {input_ids.shape}| AFTER LENGTH: {input_ids.shape[-1]}")
-            #         optimizer.zero_grad(set_to_none=True)
-            #         del optimizer, scheduler
-            #         optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay, **extra_args)
-            #         scheduler = get_linear_schedule_with_warmup(
-            #             optimizer,
-            #             num_warmup_steps=warmup_steps,
-            #             num_training_steps=total_steps
-            #         )
-            print("INPUT IDS")       
-            print(input_ids[0])
-            print("LABELS")
-            print(labels[0])
+            if prev_batch_seq == None:
+                prev_batch_seq = input_ids.shape[-1]
+          
+            bef_process_shape = input_ids.shape
+            #### Remove the rationales after the warmup steps
+            current_train_ratio = global_step/total_steps
+            if current_train_ratio > args.warmup_ratio:
+                #### Calculate entropy of the rationale and remove the unnecessary part
+                input_ids, labels = process_batch_with_entropy(model, input_ids, labels, tokenizer, current_train_ratio, args.hidden_improve, args.hidden_interval, local_rank)
+                if bef_process_shape != input_ids.shape and prev_batch_seq != input_ids.shape[-1]:
+                    print(f"BEFORE SHAPE: {bef_process_shape} | AFTER SHAPE: {input_ids.shape}| AFTER LENGTH: {input_ids.shape[-1]}")
+                    optimizer.zero_grad(set_to_none=True)
+                    del optimizer, scheduler
+                    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay, **extra_args)
+                    scheduler = get_linear_schedule_with_warmup(
+                        optimizer,
+                        num_warmup_steps=warmup_steps,
+                        num_training_steps=total_steps
+                    )
 
             outputs = model.compute_loss(input_ids=input_ids, labels=labels)
             loss = outputs.loss
-            print("Loss", loss)
-            # if bef_process_shape != input_ids.shape and prev_batch_seq != input_ids.shape[-1]:
-            #     loss = loss * args.loss_scale
-            #     print("After Scaled", loss)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
-            # if (global_step) % args.accumulate == 0 or (global_step) % len(train_dataloader)==0:
-                # torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
+            
+            '''
+            if bef_process_shape != input_ids.shape and prev_batch_seq != input_ids.shape[-1]:
+                loss = loss * args.loss_scale
+                print("After Scaled", loss)
+            '''
+
+            loss.div(args.accumulate).backward()
+            if global_step % args.accumulate == 0 or global_step % len(train_dataloader)==0:
+                torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
+                optimizer.step()
+                # scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+            
+            '''
+            Check Model's Internal Parameter during the training Step
             for name, param in model.base_model.named_parameters():
                 if torch.isnan(param.grad).any():
                         print(f"Layer: {name} | Gradient contains NaN")
@@ -444,9 +449,7 @@ def main():
                 else:
                     weight_norm = param.data.norm().item()
                     print(f"Layer: {name} | Gradient: {param.grad}| Gradient Norm: {param.grad.norm()} | Weight Norm: {weight_norm}")
-            optimizer.step()
-            # scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+            '''
 
             if local_rank == 0 and epoch_step%100 == 0:
                 training_step_data = []

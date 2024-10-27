@@ -37,9 +37,9 @@ class Mistral(nn.Module):
         Verify the Gradient
         shift_logits = shift_logits - shift_logits.max(dim=-1, keepdim=True)[0]
         '''
-        print('Logits min:', shift_logits.min())
-        print('Logits max:', shift_logits.max())
-        print('Logits mean:', shift_logits.mean())
+        # print('Logits min:', shift_logits.min())
+        # print('Logits max:', shift_logits.max())
+        # print('Logits mean:', shift_logits.mean())
 
         shift_labels = labels[..., 1:].contiguous()
         loss_fct = CrossEntropyLoss(ignore_index=-100)
@@ -51,45 +51,7 @@ class Mistral(nn.Module):
         outputs.total_loss = loss * total_tokens
         outputs.total_tokens = total_tokens
         return outputs
-    
-    # def compute_entropy(self, input_ids, labels, interval):
-    #     with torch.no_grad():
-    #         outputs = self.forward(input_ids=input_ids, labels=labels, output_hidden_states=True)
-    #     hidden_states = outputs.hidden_states
-
-    #     # print("Last Hidden_states")
-    #     # print(hidden_states[-1])
-
-    #     for name, param in self.base_model.named_parameters():
-    #         if param is None:
-    #             print("NAN VALUE IS DETECTED")
-    #             print(f"Layer: {name} | Param: {param}")
-    #             exit()
-    #         else:
-    #             pass
-
-    #     num_layers = len(hidden_states)
-    #     selected_indices = list(range(0, num_layers, interval))
-    #     if (num_layers - 1) not in selected_indices:
-    #         selected_indices.append(num_layers - 1)  # Ensure the last layer is included
-
-    #     cross_entropies = []
-    #     for i in selected_indices:
-    #         layer_hidden = hidden_states[i]  # Shape: [batch_size, seq_len, hidden_size]
-    #         with torch.no_grad():
-    #             layer_logits = self.lm_head(layer_hidden)  # Shape: [batch_size, seq_len, vocab_size]
-    #             layer_cross_entropy = self.calculate_entropy(layer_logits, input_ids)
-    #         cross_entropies.append(layer_cross_entropy)
-
-    #     # Stack the results: [num_selected_layers, batch_size]
-    #     cross_entropies = torch.stack(cross_entropies)
-
-    #     # Transpose to get [batch_size, num_selected_layers]
-    #     cross_entropies = cross_entropies.t()
-    #     print("Cross Entropy List", cross_entropies)
-
-    #     outputs.cross_entropies = cross_entropies
-    #     return outputs
+ 
     def compute_entropy(self, input_ids, labels, interval, return_seq=False):
         with torch.no_grad():
             outputs = self.forward(input_ids=input_ids, labels=labels, output_hidden_states=True)
@@ -124,28 +86,6 @@ class Mistral(nn.Module):
         outputs.cross_entropies = cross_entropies
         return outputs
 
-    # def calculate_entropy(self, logits, input_ids):
-    #     # logits shape: [batch_size, seq_len, vocab_size]
-    #     # input_ids shape: [batch_size, seq_len]
-        
-    #     # Shift logits and input_ids for next-token prediction
-    #     shift_logits = logits[:, :-1, :].contiguous()
-    #     shift_labels = input_ids[:, 1:].contiguous()
-        
-    #     # Calculate cross-entropy
-    #     loss_fct = CrossEntropyLoss(ignore_index=self.tokenizer.pad_token_id, reduction='none')
-    #     cross_entropy = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        
-    #     # Reshape cross-entropy to [batch_size, seq_len]
-    #     cross_entropy = cross_entropy.view(shift_labels.size())
-        
-    #     # Create mask for non-padding tokens
-    #     mask = (shift_labels != self.tokenizer.pad_token_id).float()
-        
-    #     # Compute mean per sample
-    #     sample_cross_entropy = (cross_entropy * mask).sum(dim=-1) / mask.sum(dim=-1)
-        
-    #     return sample_cross_entropy  # Shape: [batch_size]
     def calculate_entropy(self, logits, input_ids):
         # logits shape: [batch_size, seq_len, vocab_size]
         # input_ids shape: [batch_size, seq_len]
